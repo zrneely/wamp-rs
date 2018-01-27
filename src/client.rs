@@ -53,11 +53,11 @@ struct SubscriptionCallbackWrapper {
     callback: Box<FnMut(List, Dict)>
 }
 
-struct RegistrationCallbackWrapper {
-    callback: Callback
+struct RegistrationCallbackWrapper<C: Send> {
+    callback: Callback<C>,
 }
 
-pub type Callback = Box<FnMut(List, Dict) -> CallResult<(Option<List>, Option<Dict>)> >;
+pub type Callback<C> = Box<FnMut(List, Dict, &C) -> CallResult<(Option<List>, Option<Dict>)>>;
 
 static WAMP_JSON:&'static str = "wamp.2.json";
 static WAMP_MSGPACK:&'static str = "wamp.2.msgpack";
@@ -70,40 +70,41 @@ enum ConnectionState {
     Disconnected
 }
 
-type ConnectionResult = Result<Arc<Mutex<ConnectionInfo>>, Error>;
+type ConnectionResult<C> = Result<Arc<Mutex<ConnectionInfo<C>>>, Error>;
 
-unsafe impl <'a> Send for ConnectionInfo {}
+unsafe impl <'a, C: Send> Send for ConnectionInfo<C> {}
 
-unsafe impl<'a> Sync for ConnectionInfo {}
+unsafe impl<'a, C: Send> Sync for ConnectionInfo<C> {}
 
 unsafe impl <'a> Send for SubscriptionCallbackWrapper {}
 
 unsafe impl<'a> Sync for SubscriptionCallbackWrapper {}
 
-unsafe impl <'a> Send for RegistrationCallbackWrapper {}
+unsafe impl <'a, C: Send> Send for RegistrationCallbackWrapper<C> {}
 
-unsafe impl<'a> Sync for RegistrationCallbackWrapper {}
+unsafe impl<'a, C: Send> Sync for RegistrationCallbackWrapper<C> {}
 
-pub struct Client {
-    connection_info: Arc<Mutex<ConnectionInfo>>,
+pub struct Client<C: Send> {
+    connection_info: Arc<Mutex<ConnectionInfo<C>>>,
     max_session_id: ID,
 }
 
-pub struct ConnectionHandler {
-    connection_info: Arc<Mutex<ConnectionInfo>>,
+pub struct ConnectionHandler<C: Send> {
+    connection_info: Arc<Mutex<ConnectionInfo<C>>>,
     realm: URI,
-    state_transmission: CHSender<ConnectionResult>
+    state_transmission: CHSender<ConnectionResult<C>>,
+    context: C,
 }
 
-struct ConnectionInfo {
+struct ConnectionInfo<C: Send> {
     connection_state: ConnectionState,
     sender: Sender,
     subscription_requests: HashMap<ID, (Complete<Subscription, CallError>, SubscriptionCallbackWrapper, URI)>,
     unsubscription_requests: HashMap<ID, (Complete<(), CallError>, ID)>,
     subscriptions: HashMap<ID, SubscriptionCallbackWrapper>,
-    registrations: HashMap<ID, RegistrationCallbackWrapper>,
+    registrations: HashMap<ID, RegistrationCallbackWrapper<C>>,
     call_requests: HashMap<ID, Complete<(List, Dict), CallError>>,
-    registration_requests: HashMap<ID, (Complete<Registration, CallError>, RegistrationCallbackWrapper, URI)>,
+    registration_requests: HashMap<ID, (Complete<Registration, CallError>, RegistrationCallbackWrapper<C>, URI)>,
     unregistration_requests: HashMap<ID, (Complete<(), CallError>, ID)>,
     protocol: String,
     publish_requests: HashMap<ID, Complete<ID, CallError>>,
@@ -115,7 +116,7 @@ trait MessageSender {
     fn send_message(&self, message: Message) -> WampResult<()>;
 }
 
-impl MessageSender for ConnectionInfo{
+impl<C: Send> MessageSender for ConnectionInfo<C> {
     fn send_message(&self, message: Message) -> WampResult<()> {
 
         debug!("Sending message {:?} via {}", message, self.protocol);
@@ -156,7 +157,7 @@ impl Connection {
         }
     }
 
-    pub fn connect(&self) -> WampResult<Client> {
+    pub fn connect<C: 'static + Send + Clone>(&self, context: C) -> WampResult<Client<C>> {
         let (tx, rx) = channel();
         let url = self.url.clone();
         let realm = self.realm.clone();
@@ -182,10 +183,11 @@ impl Connection {
                     session_id: 0
                 }));
 
-                 ConnectionHandler {
+                ConnectionHandler {
                     state_transmission: tx.clone(),
                     connection_info: info,
-                    realm: realm.clone()
+                    realm: realm.clone(),
+                    context: context.clone(),
                 }
             }).map_err(|e| {
                 Error::new(ErrorKind::WSError(e))
@@ -199,7 +201,7 @@ impl Connection {
         let info = try!(rx.recv().unwrap());
         Ok(Client{
             connection_info: info,
-            max_session_id: 0
+            max_session_id: 0,
         })
     }
 
@@ -221,7 +223,7 @@ macro_rules! cancel_future {
     });
 }
 
-impl Handler for ConnectionHandler {
+impl<C: Send> Handler for ConnectionHandler<C> {
     fn on_open(&mut self, handshake: Handshake) -> WSResult<()> {
         debug!("Connection Opened");
         let mut info = self.connection_info.lock().unwrap();
@@ -324,7 +326,7 @@ impl Handler for ConnectionHandler {
 }
 
 
-impl ConnectionHandler {
+impl<C: Send> ConnectionHandler<C> {
 
     fn handle_message(&mut self, message: Message) -> bool {
         let mut info = self.connection_info.lock().unwrap();
@@ -399,7 +401,7 @@ impl ConnectionHandler {
         true
     }
 
-    fn handle_subscribed(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID, subscription_id: ID) {
+    fn handle_subscribed(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID, subscription_id: ID) {
         // TODO handle errors here
         info!("Received a subscribed notification");
         match info.subscription_requests.remove(&request_id) {
@@ -416,7 +418,7 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_subscribe_error(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
+    fn handle_subscribe_error(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
         warn!("Received an error for a subscription");
         match info.subscription_requests.remove(&request_id) {
             Some((promise, _, _)) => {
@@ -429,7 +431,7 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_unsubscribed(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID) {
+    fn handle_unsubscribed(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID) {
         match info.unsubscription_requests.remove(&request_id) {
             Some((promise, subscription_id)) => {
                 info.unsubscription_requests.remove(&subscription_id);
@@ -442,7 +444,7 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_unsubscribe_error(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
+    fn handle_unsubscribe_error(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
         match info.unsubscription_requests.remove(&request_id) {
             Some((promise, subscription_id)) => {
                 info.unsubscription_requests.remove(&subscription_id);
@@ -455,7 +457,7 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_registered(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID, registration_id: ID) {
+    fn handle_registered(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID, registration_id: ID) {
         // TODO handle errors here
         info!("Received a registered notification");
         match info.registration_requests.remove(&request_id) {
@@ -471,7 +473,7 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_register_error(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
+    fn handle_register_error(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
         info!("Received a registration error");
         match info.registration_requests.remove(&request_id) {
             Some((promise, _, _)) => {
@@ -484,7 +486,7 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_unregistered(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID) {
+    fn handle_unregistered(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID) {
         match info.unregistration_requests.remove(&request_id) {
             Some((promise, registration_id)) => {
                 info.registrations.remove(&registration_id);
@@ -497,7 +499,7 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_unregister_error(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
+    fn handle_unregister_error(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
         match info.unregistration_requests.remove(&request_id) {
             Some((promise, _)) => {
                 drop(info);
@@ -509,7 +511,7 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_published(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID, publication_id: ID) {
+    fn handle_published(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID, publication_id: ID) {
         match info.publish_requests.remove(&request_id) {
             Some(promise) => {
                 promise.complete(publication_id);
@@ -519,7 +521,7 @@ impl ConnectionHandler {
             }
         }
     }
-    fn handle_publish_error(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
+    fn handle_publish_error(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
         match info.publish_requests.remove(&request_id) {
             Some(promise) => {
                 promise.fail(CallError::new(reason, args, kwargs))
@@ -530,19 +532,19 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_welcome(&self, mut info: MutexGuard<ConnectionInfo>, session_id: ID, _details: WelcomeDetails) {
+    fn handle_welcome(&self, mut info: MutexGuard<ConnectionInfo<C>>, session_id: ID, _details: WelcomeDetails) {
         info.session_id = session_id;
         info.connection_state = ConnectionState::Connected;
         drop(info);
         self.state_transmission.send(Ok(Arc::clone(&self.connection_info))).unwrap();
     }
 
-    fn handle_abort(&self, mut info: MutexGuard<ConnectionInfo>, reason: Reason) {
+    fn handle_abort(&self, mut info: MutexGuard<ConnectionInfo<C>>, reason: Reason) {
         error!("Router aborted connection.  Reason: {:?}", reason);
         info.connection_state = ConnectionState::ShuttingDown;
     }
 
-    fn handle_event(&self, mut info: MutexGuard<ConnectionInfo>, subscription_id: ID, args: Option<List>, kwargs: Option<Dict>) {
+    fn handle_event(&self, mut info: MutexGuard<ConnectionInfo<C>>, subscription_id: ID, args: Option<List>, kwargs: Option<Dict>) {
         let args = args.unwrap_or_default();
         let kwargs = kwargs.unwrap_or_default();
         match info.subscriptions.get_mut(&subscription_id) {
@@ -556,13 +558,13 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_invocation(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID, registration_id: ID, _details: InvocationDetails, args: Option<List>, kwargs: Option<Dict>) {
+    fn handle_invocation(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID, registration_id: ID, _details: InvocationDetails, args: Option<List>, kwargs: Option<Dict>) {
         let args = args.unwrap_or_default();
         let kwargs = kwargs.unwrap_or_default();
         let message = match info.registrations.get_mut(&registration_id) {
             Some(registration) => {
                 let callback = &mut registration.callback;
-                match callback(args, kwargs) {
+                match callback(args, kwargs, &self.context) {
                         Ok((rargs, rkwargs)) => {
                             Message::Yield(request_id, YieldOptions::new(), rargs, rkwargs)
                         }, Err(error) => {
@@ -579,7 +581,7 @@ impl ConnectionHandler {
         info.send_message(message).ok();
     }
 
-    fn handle_result(&self, mut info: MutexGuard<ConnectionInfo>, call_id: ID, _details: ResultDetails, args: Option<List>, kwargs: Option<Dict>) {
+    fn handle_result(&self, mut info: MutexGuard<ConnectionInfo<C>>, call_id: ID, _details: ResultDetails, args: Option<List>, kwargs: Option<Dict>) {
         let args = args.unwrap_or_default();
         let kwargs = kwargs.unwrap_or_default();
         match info.call_requests.remove(&call_id) {
@@ -592,7 +594,7 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_call_error(&self, mut info: MutexGuard<ConnectionInfo>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
+    fn handle_call_error(&self, mut info: MutexGuard<ConnectionInfo<C>>, request_id: ID, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
         match info.call_requests.remove(&request_id) {
             Some(promise) => {
                 promise.fail(CallError::new(reason, args, kwargs))
@@ -603,7 +605,7 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_goodbye(&self, mut info: MutexGuard<ConnectionInfo>, reason: Reason) {
+    fn handle_goodbye(&self, mut info: MutexGuard<ConnectionInfo<C>>, reason: Reason) {
         info!("Router said goodbye.  Reason: {:?}", reason);
 
         info.send_message(Message::Goodbye(ErrorDetails::new(), Reason::GoodbyeAndOut)).unwrap();
@@ -612,7 +614,7 @@ impl ConnectionHandler {
     }
 
     #[cfg_attr(feature = "cargo-clippy", allow(too_many_arguments))]
-    fn handle_error(&self, info: MutexGuard<ConnectionInfo>, e_type: ErrorType, request_id: ID, _details: Dict, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
+    fn handle_error(&self, info: MutexGuard<ConnectionInfo<C>>, e_type: ErrorType, request_id: ID, _details: Dict, reason: Reason, args: Option<List>, kwargs: Option<Dict>) {
         match e_type {
             ErrorType::Subscribe => {
                 self.handle_subscribe_error(info, request_id, reason, args, kwargs)
@@ -640,7 +642,7 @@ impl ConnectionHandler {
 
 }
 
-impl Client {
+impl<C: Send> Client<C> {
 
     fn get_next_session_id(&mut self) -> ID {
         self.max_session_id += 1;
@@ -651,7 +653,7 @@ impl Client {
         // Send a subscribe messages
         let request_id = self.get_next_session_id();
         let (complete, future) = Future::<Subscription, CallError>::pair();
-        let callback = SubscriptionCallbackWrapper {callback: callback};
+        let callback = SubscriptionCallbackWrapper { callback: callback };
         let mut options = SubscribeOptions::new();
         if policy != MatchingPolicy::Strict {
             options.pattern_match = policy
@@ -666,11 +668,11 @@ impl Client {
         self.subscribe_with_pattern(topic, callback, MatchingPolicy::Strict)
     }
 
-    pub fn register_with_pattern(&mut self, procedure_pattern: URI, callback: Callback, policy: MatchingPolicy) -> WampResult<Future<Registration, CallError>> {
+    pub fn register_with_pattern(&mut self, procedure_pattern: URI, callback: Callback<C>, policy: MatchingPolicy) -> WampResult<Future<Registration, CallError>> {
         // Send a register message
         let request_id = self.get_next_session_id();
         let (complete, future) = Future::<Registration, CallError>::pair();
-        let callback = RegistrationCallbackWrapper {callback: callback};
+        let callback = RegistrationCallbackWrapper { callback };
         let mut options = RegisterOptions::new();
         if policy != MatchingPolicy::Strict {
             options.pattern_match = policy
@@ -679,11 +681,11 @@ impl Client {
         let mut info = self.connection_info.lock().unwrap();
         debug!("Lock on connection info acquired");
         info.registration_requests.insert(request_id, (complete, callback, procedure_pattern.clone()));
-        try!(info.send_message(Message::Register(request_id, options, procedure_pattern)));
+        info.send_message(Message::Register(request_id, options, procedure_pattern))?;
         Ok(future)
     }
 
-    pub fn register(&mut self, procedure: URI, callback: Callback) -> WampResult<Future<Registration, CallError>> {
+    pub fn register(&mut self, procedure: URI, callback: Callback<C>) -> WampResult<Future<Registration, CallError>> {
         self.register_with_pattern(procedure, callback, MatchingPolicy::Strict)
     }
 
@@ -749,7 +751,7 @@ impl Client {
     }
 }
 
-impl fmt::Debug for ConnectionHandler {
+impl<C: Send> fmt::Debug for ConnectionHandler<C> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{{Connection id: {}}}", self.connection_info.lock().unwrap().session_id)
     }
